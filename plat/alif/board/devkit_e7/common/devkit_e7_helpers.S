@@ -18,6 +18,7 @@
 	.globl	plat_crash_console_flush
 	.globl	wfi_loop
 	.globl	secondary_cpu_flags
+	.extern	ensemble_secondary_ppu_off
 
 	/* --------------------------------------------------------------------
 	 * void plat_secondary_cold_boot_setup (void);
@@ -39,12 +40,29 @@ poll_flag:
 	lsl	r0, r0, #2
 	ldr	r1, =secondary_cpu_flags
 	add	r1, r1, r0
+	/*
+	 * SMPEN is already clear, so this core is outside coherency.
+	 * Drop the cached flag line or CPU_ON / SYSTEM_OFF writes are missed.
+	 */
+	mcr	p15, 0, r1, c7, c6, 1
+	dsb
 	ldr	r1, [r1]
+	mov	r0, #0xFF		/* SYSTEM_OFF: enter PPU power-down */
+	cmp	r1, r0
+	beq	do_ppu_off
 	mov	r0, #0xADD		/* Wait for PSCI CPU_ON flag */
 	cmp	r1, r0
 	beq	go_warm
+	/*
+	 * WFI, not WFE: SEV will not wake this. CPU_ON / SYSTEM_OFF
+	 * must set HOST_CPU_WAKEUP (and BOOT_MSK) to leave this WFI.
+	 */
 	wfi
 	b	poll_flag
+
+do_ppu_off:
+	ldr	r0, =ensemble_secondary_ppu_off
+	bx	r0
 
 go_warm:
 	/* Clear go-flag before warm entry so CPU_OFF cannot re-take this path */

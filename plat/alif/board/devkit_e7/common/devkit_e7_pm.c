@@ -11,20 +11,42 @@
 #include <arch_helpers.h>
 #include <common/debug.h>
 #include <drivers/console.h>
+#include <drivers/delay_timer.h>
 #include <lib/mmio.h>
 #include <lib/psci/psci.h>
+#include <plat/alif/common/alif_mhu.h>
 #include <plat/alif/common/plat_alif.h>
 #include <plat/common/platform.h>
 
 #define HOST_BASE_SYS_CTRL		0x1A010000
 #define HOST_CPU_BOOT_MSK		0x300
+#define HOST_CPU_CLUS_PWR_REQ		0x304
 #define HOST_CPU_WAKEUP			0x308
 #define HOST_CHS_PWR_REQ		0x400
+#define HOST_CHS_PWR_ST			0x404
 #define SECONDARY_CPU_GO_FLAG		0x000ADD
+/* Multiplier to Calculate the delay */
+#define MULT 100
+/*
+ * Parked secondaries watch this instead of 0xADD. It sends them through
+ * the same PPU handshake as a32_pon_poff_test.c so PD-9 can drop.
+ */
+#define SECONDARY_CLUSTER_OFF_FLAG	0x0000FF
+/* Parked CPU1 writes this after leaving WFI so CPU0 can see the wake. */
+#define SECONDARY_PPU_OFF_ACK		0x0000F1
+
+/* Per-core PPU (RTL a32_ppu_access_checks / bk4 PON-POFF). */
+#define HOST_CPU_CORE_PPU_0_BASE	0x1BC10000
+#define HOST_CPU_CORE_PPU_1_BASE	0x1BC20000
+#define PPU_PWPR			0x000
+#define PPU_PWSR			0x008
+/* PWR_DYN_EN | PWR_POLICY=OFF. Default ON policy is 0x108. */
+#define PPU_PWPR_OFF_DYN		0x100
 
 extern unsigned int secondary_cpu_flags[PLATFORM_CORE_COUNT];
 
 void __dead2 plat_secondary_cold_boot_setup(void);
+void __dead2 ensemble_secondary_ppu_off(void);
 
 static unsigned int ensemble_mpidr_to_cpu(u_register_t mpidr)
 {
@@ -119,14 +141,14 @@ ensemble_pwr_domain_pwr_down_wfi(const psci_power_state_t *target_state)
 {
 	(void)target_state;
 
-	disable_mmu_icache_secure();
-
 	/*
-	 * Keep the secure MMU enabled: BL32 is XIP (flash) with RW in SRAM.
-	 * Disabling the MMU here can fault and cause PSCI CPU_OFF to return
-	 * to Linux, which panics with "psci: cpu N failed to shutdown".
-	 */
-	plat_secondary_cold_boot_setup();
+	 * RTL cpu_test_hook() for A32_1: HOST_CPU_WAKEUP=0, then
+	 * power_down_cpu_core() / WFI. Do that on PSCI CPU_OFF so
+	 * echo 0 > cpu1/online actually drops a32_1 PPU, not a park WFI.
+	 * CPU_ON still brings it back with BOOT_MSK + WAKEUP (cold reset
+	 * into the 0xADD park loop).
+         */
+	ensemble_secondary_ppu_off();
 }
 
 static int ensemble_validate_ns_entrypoint(uintptr_t entrypoint)
@@ -164,55 +186,17 @@ static void ensemble_disable_smp(void)
 		: "r0", "r1", "memory");
 }
 
-static void __dead2 ensemble_system_off(void)
+/*
+ * CPU-side PPU handshake from power_down_cpu_core() in
+ * a32_pon_poff_test.c:
+ *   1. clean+invalidate caches while SCTLR.C is still set
+ *   2. clear SCTLR.C
+ *   3. clear CPUECTLR.SMPEN and set DBGOSDLR.DLK
+ *
+ * After this, WFI lets the core PPU cut power.
+ */
+static void ensemble_cpu_prepare_ppu_off(void)
 {
-	INFO("PSCI: system off  APSS cluster\n");
-
-	/*
-	 * Same sequence as lp_enter_low_pwr_mode_self(OFF) /
-	 * power_down_cpu_core() in the A32 PON/POFF test:
-	 *
-	 *   1. Mask IRQs/FIQs and disable GIC so nothing can wake WFI
-	 *   2. Clear HOST_CPU_WAKEUP / BOOT_MSK for both A32 cores
-	 *   3. Drop CHS_PWR_REQ (SYSTOP/PD-9, DBGTOP, REFCLK, WAKEUP_EN)
-	 *   4. DBGOSDLR.DLK so debug cannot hold the core out of WFI
-	 *   5. Clean+invalidate L1/L2 while D-cache is still on
-	 *   6. Disable D-cache, leave I-cache/MMU (BL32 is XIP)
-	 *   7. Drop SMPEN
-	 *   8. WFI — PPU cuts PD-9 once every A32 is in WFI
-	 *
-	 * Linux has already CPU_OFF'd the secondary into the park WFI.
-	 * This path runs on CPU 0, the last remaining core.
-	 */
-	disable_irq();
-	disable_fiq();
-
-	plat_alif_gic_cpuif_disable();
-	/* GICD_CTLR: turn the distributor off so SPIs cannot wake the cluster. */
-	mmio_write_32(PLAT_ALIF_GICD_BASE, 0U);
-	dsb();
-
-	mmio_write_32(HOST_BASE_SYS_CTRL + HOST_CPU_WAKEUP, 0U);
-	mmio_write_32(HOST_BASE_SYS_CTRL + HOST_CPU_BOOT_MSK, 0U);
-
-	/*
-	 * CHS_PWR_REQ @ 0x400:
-	 *   [0]     WAKEUP_EN
-	 *   [1]     REFCLK_REQ
-	 *   [2]     DBGTOP_PWR_REQ
-	 *   [5:3]   SYSTOP_PWR_REQ  (APSS / PD-9)
-	 * Writing 0 drops SYSTOP so the PPU may power-off the cluster in WFI.
-	 */
-	mmio_write_32(HOST_BASE_SYS_CTRL + HOST_CHS_PWR_REQ, 0U);
-	dsb();
-	isb();
-
-	write_dbgosdlr(read_dbgosdlr() | 0x1U);
-
-	INFO("PSCI: entering WFI for A32-cores power-off\n");
-	console_flush();
-
-	/* Clean+invalidate all cache levels while SCTLR.C is still set. */
 	dcsw_op_all(DC_OP_CISW);
 	dsb();
 	isb();
@@ -221,13 +205,217 @@ static void __dead2 ensemble_system_off(void)
 	isb();
 	dsb();
 
+	write_dbgosdlr(read_dbgosdlr() | 0x1U);
 	ensemble_disable_smp();
+}
 
+static void __dead2 ensemble_wfi_forever(void)
+{
 	for (;;) {
 		dsb();
 		isb();
 		wfi();
 	}
+}
+
+/*
+ * Last step of a parked secondary during SYSTEM_OFF. Hotplug CPU_OFF still
+ * uses the 0xADD park loop; only ensemble_system_off posts 0xFF.
+ */
+void __dead2 ensemble_secondary_ppu_off(void)
+{
+	unsigned int cpu = ensemble_mpidr_to_cpu(read_mpidr_el1());
+	unsigned int val;
+
+	if ((cpu > 0U) && (cpu < PLATFORM_CORE_COUNT)) {
+		secondary_cpu_flags[cpu - 1U] = SECONDARY_PPU_OFF_ACK;
+		flush_dcache_range((uintptr_t)&secondary_cpu_flags,
+				   sizeof(secondary_cpu_flags));
+		dsb();
+	}
+
+	/* No INFO() here: SMPEN is already clear in the park loop. */
+
+	disable_irq();
+	disable_fiq();
+	plat_alif_gic_cpuif_disable();
+
+	/*
+	 * RTL cpu_test_hook(): HOST_CPU_WAKEUP.W = 0 before WFI.
+	 * A set wakeup bit holds this core's PPU ON.
+	 */
+	mmio_write_32(HOST_BASE_SYS_CTRL + HOST_CPU_WAKEUP, 0U);
+	if ((cpu > 0U) && (cpu < PLATFORM_CORE_COUNT)) {
+		val = mmio_read_32(HOST_BASE_SYS_CTRL + HOST_CPU_BOOT_MSK);
+		val &= ~(1U << cpu);
+		mmio_write_32(HOST_BASE_SYS_CTRL + HOST_CPU_BOOT_MSK, val);
+	}
+
+	/* Local PWPR write — a write from the other core is ignored (PWSR stays 0x108). */
+	mmio_write_32(HOST_CPU_CORE_PPU_0_BASE + (cpu * 0x10000U) + PPU_PWPR,
+		      PPU_PWPR_OFF_DYN);
+	dsb();
+
+	ensemble_cpu_prepare_ppu_off();
+	ensemble_wfi_forever();
+}
+
+/**
+ * @brief Microsecond delay
+ */
+static void mx_delay_us(uint32_t us)
+{
+    volatile uint32_t count = us * MULT;
+    while (count--) {
+        __asm__ volatile("nop");
+    }
+}
+
+static void ensemble_request_secondary_ppu_off(void)
+{
+	unsigned int i;
+	unsigned int val;
+	unsigned int flag = 0U;
+	uint32_t pwsr = 0U;
+
+	pwsr = mmio_read_32(HOST_CPU_CORE_PPU_1_BASE + PPU_PWSR);
+	if ((pwsr & 0xFU) == 0U) {
+		INFO("PSCI: CORE1 already OFF (PWSR=0x%x), skip wake\n", pwsr);
+		return;
+	}
+
+	for (i = 0U; i < (PLATFORM_CORE_COUNT - 1U); i++) {
+		secondary_cpu_flags[i] = SECONDARY_CLUSTER_OFF_FLAG;
+	}
+	flush_dcache_range((uintptr_t)&secondary_cpu_flags,
+			   sizeof(secondary_cpu_flags));
+	dsb();
+
+	/*
+	 * Parked cores wait in WFI. SEV does not wake WFI — that is why
+	 * the previous 0xFF+SEV path left CORE1 PWSR at 0x108.
+	 * PSCI CPU_ON (echo 1 > cpu1/online) releases them with BOOT_MSK
+	 * and HOST_CPU_WAKEUP; use the same wake, with flag 0xFF.
+	 */
+	val = mmio_read_32(HOST_BASE_SYS_CTRL + HOST_CPU_BOOT_MSK);
+	val |= (1U << 1);
+	mmio_write_32(HOST_BASE_SYS_CTRL + HOST_CPU_BOOT_MSK, val);
+
+	val = mmio_read_32(HOST_BASE_SYS_CTRL + HOST_CPU_WAKEUP);
+	val |= (1U << 1);
+	mmio_write_32(HOST_BASE_SYS_CTRL + HOST_CPU_WAKEUP, val);
+	dsb();
+	sev();
+
+	INFO("PSCI: woke CPU1 for PPU-off BOOT_MSK=0x%x WAKEUP=0x%x\n",
+	     mmio_read_32(HOST_BASE_SYS_CTRL + HOST_CPU_BOOT_MSK),
+	     mmio_read_32(HOST_BASE_SYS_CTRL + HOST_CPU_WAKEUP));
+
+	for (i = 0U; i < 1000U; i++) {
+		flush_dcache_range((uintptr_t)&secondary_cpu_flags,
+				   sizeof(secondary_cpu_flags));
+		flag = secondary_cpu_flags[0];
+		pwsr = mmio_read_32(HOST_CPU_CORE_PPU_1_BASE + PPU_PWSR);
+		if ((pwsr & 0xFU) == 0U) {
+			break;
+		}
+		mx_delay_us(100);
+	}
+
+	INFO("PSCI: CPU1 handshake flag=0x%x CORE1_PWSR=0x%x (%u x100us)\n",
+	     flag, pwsr, i);
+}
+
+/*
+ * Fallback only: CPU1 must write its own PWPR. A write from CPU0 is
+ * ignored while the target has not done the local handshake (PWSR stays
+ * 0x108). Do not clear BOOT_MSK here — that raced the wake pulse.
+ */
+static void ensemble_force_core1_ppu_off(void)
+{
+	uint32_t pwsr = 0U;
+	unsigned int i;
+
+	/* bit[0] MEM_RET_REQ, bit[1] CLUSTOP PWR_REQ. 0 = allow low power. */
+	mmio_write_32(HOST_BASE_SYS_CTRL + HOST_CPU_CLUS_PWR_REQ, 0U);
+
+	INFO("PSCI: CORE1 PPU PWSR before OFF=0x%x CLUS_PWR_REQ=0x%x\n",
+	     mmio_read_32(HOST_CPU_CORE_PPU_1_BASE + PPU_PWSR),
+	     mmio_read_32(HOST_BASE_SYS_CTRL + HOST_CPU_CLUS_PWR_REQ));
+
+	mmio_write_32(HOST_CPU_CORE_PPU_1_BASE + PPU_PWPR, PPU_PWPR_OFF_DYN);
+	dsb();
+
+	for (i = 0U; i < 100U; i++) {
+		pwsr = mmio_read_32(HOST_CPU_CORE_PPU_1_BASE + PPU_PWSR);
+		if ((pwsr & 0xFU) == 0U) {
+			break;
+		}
+		mx_delay_us(100);
+	}
+
+	INFO("PSCI: CORE1 PPU PWSR after OFF=0x%x (policy nibble %u)\n",
+	     pwsr, pwsr & 0xFU);
+}
+
+static void __dead2 ensemble_system_off(void)
+{
+	INFO("PSCI: system off APSS cluster\n");
+
+	/*
+	 * Tell M55-HE that A32 is going off and wait a bounded ~500 ms for
+	 * A32_GOING_OFF_ACK. MHU0 channel 0 doorbells, same as the Linux/
+	 * Zephyr MHU0 samples. Do this before GIC/chassis teardown so the
+	 * mailbox is still live. A timeout does not abort SYSTEM_OFF.
+	 */
+	if (alif_mhu_notify_going_off() != 0) {
+		WARN("PSCI: M55-HE did not ACK A32_GOING_OFF; continuing\n");
+	}
+	alif_mhu_shutdown();
+
+	/*
+	 * CPU_OFF parks CPU1 in WFI. Wake it the CPU_ON way, post 0xFF
+	 * so it runs the PON/POFF handshake, then fall back to a PWPR write.
+	 */
+	ensemble_request_secondary_ppu_off();
+	ensemble_force_core1_ppu_off();
+
+	disable_irq();
+	disable_fiq();
+
+	plat_alif_gic_cpuif_disable();
+	/* GICD_CTLR: turn the distributor off so SPIs cannot wake the cluster. */
+	mmio_write_32(PLAT_ALIF_GICD_BASE, 0U);
+	dsb();
+
+	/*
+	 * Clear per-core wakeup so neither core is held ON. Do not clear
+	 * HOST_CPU_BOOT_MSK for CPU 0: the working PON/POFF test never
+	 * does, and zeroing the boot mask can reset the core before WFI.
+	 */
+	mmio_write_32(HOST_BASE_SYS_CTRL + HOST_CPU_WAKEUP, 0U);
+
+	/*
+	 * CHS_PWR_REQ @ 0x400 (bk4 power_down_cpu_core):
+	 *   [0]     WAKEUP_EN
+	 *   [1]     REFCLK_REQ
+	 *   [2]     DBGTOP_PWR_REQ
+	 *   [5:3]   SYSTOP_PWR_REQ  (APSS cluster / SE PD-9)
+	 * Writing 0 drops SYSTOP so the PPU may power-off the cluster.
+	 */
+	mmio_write_32(HOST_BASE_SYS_CTRL + HOST_CHS_PWR_REQ, 0U);
+	dsb();
+	isb();
+
+	INFO("PSCI: CHS_PWR_REQ=0x%x ST=0x%x WAKEUP=0x%x CORE1_PWSR=0x%x, WFI\n",
+	     mmio_read_32(HOST_BASE_SYS_CTRL + HOST_CHS_PWR_REQ),
+	     mmio_read_32(HOST_BASE_SYS_CTRL + HOST_CHS_PWR_ST),
+	     mmio_read_32(HOST_BASE_SYS_CTRL + HOST_CPU_WAKEUP),
+	     mmio_read_32(HOST_CPU_CORE_PPU_1_BASE + PPU_PWSR));
+	console_flush();
+
+	ensemble_cpu_prepare_ppu_off();
+	ensemble_wfi_forever();
 }
 
 /*******************************************************************************

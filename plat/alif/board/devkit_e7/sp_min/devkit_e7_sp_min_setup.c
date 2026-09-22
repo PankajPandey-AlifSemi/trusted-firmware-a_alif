@@ -5,6 +5,7 @@
  */
 
 #include <plat/alif/common/plat_alif.h>
+#include <plat/alif/common/alif_mhu.h>
 #include <lib/mmio.h>
 #include <common/debug.h>
 #include <drivers/delay_timer.h>
@@ -214,5 +215,7 @@ void plat_alif_sp_min_platform_setup(void)
     value |= POWER_Q_ENABLE;
     value |= CLOCK_Q_ENABLE;
     mmio_write_32((NPU_HG_ADDR + NPUHG_CMD), value);
+
+    alif_mhu_init();
 #endif /* ALIF_SOC_E8 */
 }
