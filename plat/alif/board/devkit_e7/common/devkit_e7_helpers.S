@@ -21,36 +21,61 @@
 
 	/* --------------------------------------------------------------------
 	 * void plat_secondary_cold_boot_setup (void);
+	 *
+	 * Park secondary CPUs until PSCI CPU_ON sets secondary_cpu_flags to
+	 * 0xADD, then jump to the SP_MIN warm entrypoint. Re-poll after each
+	 * WFI so soft hotplug (CPU_OFF -> CPU_ON) works without a full reset.
 	 * --------------------------------------------------------------------
 	 */
 func plat_secondary_cold_boot_setup
-	mrc p15, 0, r0, c0, c0, 5	/* Read MPIDR to get current cpu core */
+	mrrc	15, 1, r0, r1, cr15
+	bic	r0, r0, #0x40		/* Disable SMP_EN bit in CPUECTLR */
+	mcrr	15, 1, r0, r1, cr15
+
+poll_flag:
+	mrc	p15, 0, r0, c0, c0, 5	/* Read MPIDR */
 	and	r0, r0, #0x3
 	sub	r0, r0, #1
 	lsl	r0, r0, #2
 	ldr	r1, =secondary_cpu_flags
 	add	r1, r1, r0
-	ldr	r1, [r1 , #0]
-	mov	r0, #0xADD		/* Test if the flag 0xADD has been set */
+	ldr	r1, [r1]
+	mov	r0, #0xADD		/* Wait for PSCI CPU_ON flag */
 	cmp	r1, r0
-	bne	wfi_loop		/* If not go to wfi and powerdown */
+	beq	go_warm
+	wfi
+	b	poll_flag
+
+go_warm:
+	/* Clear go-flag before warm entry so CPU_OFF cannot re-take this path */
+	mrc	p15, 0, r0, c0, c0, 5
+	and	r0, r0, #0x3
+	sub	r0, r0, #1
+	lsl	r0, r0, #2
+	ldr	r1, =secondary_cpu_flags
+	add	r1, r1, r0
+	mov	r0, #0
+	str	r0, [r1]
+	dsb
 	ldr	r9, =sp_min_warm_entrypoint
 	mov	pc, r9
 endfunc plat_secondary_cold_boot_setup
 
+	/* --------------------------------------------------------------------
+	 * void wfi_loop(void);
+	 *
+	 * Legacy entry used by cold-boot / CPU_OFF paths; falls into the
+	 * same flag-polling park loop as plat_secondary_cold_boot_setup.
+	 * --------------------------------------------------------------------
+	 */
 func wfi_loop
-	mrrc    15, 1, r0, r1, cr15
-	bic     r0, r0, #0x40 		/* Disable SMP_EN bit in CPUECTLR reg */
-	mcrr    15, 1, r0, r1, cr15
-wfi_lp:	mov r0,r0
-	wfi
-	b	wfi_lp
+	b	plat_secondary_cold_boot_setup
 endfunc wfi_loop
 
 	.pushsection .data
 	.align 2
 secondary_cpu_flags:
-	.rept	10
+	.rept	PLATFORM_CORE_COUNT
 	.word	0
 	.endr
 	.popsection
