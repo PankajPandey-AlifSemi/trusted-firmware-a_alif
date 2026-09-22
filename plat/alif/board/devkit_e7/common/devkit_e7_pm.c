@@ -9,6 +9,8 @@
 
 #include <arch.h>
 #include <arch_helpers.h>
+#include <common/debug.h>
+#include <drivers/console.h>
 #include <lib/mmio.h>
 #include <lib/psci/psci.h>
 #include <plat/alif/common/plat_alif.h>
@@ -17,6 +19,7 @@
 #define HOST_BASE_SYS_CTRL		0x1A010000
 #define HOST_CPU_BOOT_MSK		0x300
 #define HOST_CPU_WAKEUP			0x308
+#define HOST_CHS_PWR_REQ		0x400
 #define SECONDARY_CPU_GO_FLAG		0x000ADD
 
 extern unsigned int secondary_cpu_flags[PLATFORM_CORE_COUNT];
@@ -85,6 +88,11 @@ static void ensemble_pwr_domain_off(const psci_power_state_t *target_state)
 
 	(void)target_state;
 
+	/*
+	 * PSCI CPU_OFF is only used for secondary hotplug. SYSTEM_OFF of the
+	 * last remaining CPU (always CPU 0) must not come through this path:
+	 * secondary_cpu_flags is indexed as [cpu - 1].
+	 */
 	assert(cpu > 0U);
 	assert(cpu < PLATFORM_CORE_COUNT);
 
@@ -139,6 +147,89 @@ static int ensemble_validate_ns_entrypoint(uintptr_t entrypoint)
 	return PSCI_E_SUCCESS;
 }
 
+/*
+ * Leave intra-cluster coherency. Matches power_down_cpu_core() in
+ * a32_pon_poff_test.c: BIC CPUECTLR.SMPEN then DSB/ISB.
+ */
+static void ensemble_disable_smp(void)
+{
+	__asm__ volatile(
+		"mrrc	p15, 1, r0, r1, c15\n"
+		"bic	r0, r0, %0\n"
+		"mcrr	p15, 1, r0, r1, c15\n"
+		"isb\n"
+		"dsb	sy\n"
+		:
+		: "I" (0x40)
+		: "r0", "r1", "memory");
+}
+
+static void __dead2 ensemble_system_off(void)
+{
+	INFO("PSCI: system off  APSS cluster\n");
+
+	/*
+	 * Same sequence as lp_enter_low_pwr_mode_self(OFF) /
+	 * power_down_cpu_core() in the A32 PON/POFF test:
+	 *
+	 *   1. Mask IRQs/FIQs and disable GIC so nothing can wake WFI
+	 *   2. Clear HOST_CPU_WAKEUP / BOOT_MSK for both A32 cores
+	 *   3. Drop CHS_PWR_REQ (SYSTOP/PD-9, DBGTOP, REFCLK, WAKEUP_EN)
+	 *   4. DBGOSDLR.DLK so debug cannot hold the core out of WFI
+	 *   5. Clean+invalidate L1/L2 while D-cache is still on
+	 *   6. Disable D-cache, leave I-cache/MMU (BL32 is XIP)
+	 *   7. Drop SMPEN
+	 *   8. WFI — PPU cuts PD-9 once every A32 is in WFI
+	 *
+	 * Linux has already CPU_OFF'd the secondary into the park WFI.
+	 * This path runs on CPU 0, the last remaining core.
+	 */
+	disable_irq();
+	disable_fiq();
+
+	plat_alif_gic_cpuif_disable();
+	/* GICD_CTLR: turn the distributor off so SPIs cannot wake the cluster. */
+	mmio_write_32(PLAT_ALIF_GICD_BASE, 0U);
+	dsb();
+
+	mmio_write_32(HOST_BASE_SYS_CTRL + HOST_CPU_WAKEUP, 0U);
+	mmio_write_32(HOST_BASE_SYS_CTRL + HOST_CPU_BOOT_MSK, 0U);
+
+	/*
+	 * CHS_PWR_REQ @ 0x400:
+	 *   [0]     WAKEUP_EN
+	 *   [1]     REFCLK_REQ
+	 *   [2]     DBGTOP_PWR_REQ
+	 *   [5:3]   SYSTOP_PWR_REQ  (APSS / PD-9)
+	 * Writing 0 drops SYSTOP so the PPU may power-off the cluster in WFI.
+	 */
+	mmio_write_32(HOST_BASE_SYS_CTRL + HOST_CHS_PWR_REQ, 0U);
+	dsb();
+	isb();
+
+	write_dbgosdlr(read_dbgosdlr() | 0x1U);
+
+	INFO("PSCI: entering WFI for A32-cores power-off\n");
+	console_flush();
+
+	/* Clean+invalidate all cache levels while SCTLR.C is still set. */
+	dcsw_op_all(DC_OP_CISW);
+	dsb();
+	isb();
+
+	write_sctlr(read_sctlr() & ~SCTLR_C_BIT);
+	isb();
+	dsb();
+
+	ensemble_disable_smp();
+
+	for (;;) {
+		dsb();
+		isb();
+		wfi();
+	}
+}
+
 /*******************************************************************************
  * Export the platform handlers via plat_alif_psci_pm_ops. The ALIF Standard
  * platform layer will take care of registering the handlers with PSCI.
@@ -149,6 +240,7 @@ plat_psci_ops_t plat_alif_psci_pm_ops = {
 	.pwr_domain_off = ensemble_pwr_domain_off,
 	.pwr_domain_pwr_down_wfi = ensemble_pwr_domain_pwr_down_wfi,
 	.validate_ns_entrypoint = ensemble_validate_ns_entrypoint,
+	.system_off = ensemble_system_off
 };
 
 const plat_psci_ops_t *plat_alif_psci_override_pm_ops(plat_psci_ops_t *ops)

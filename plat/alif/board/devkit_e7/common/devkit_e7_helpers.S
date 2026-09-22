@@ -70,6 +70,7 @@ endfunc plat_secondary_cold_boot_setup
 	 */
 func wfi_loop
 	b	plat_secondary_cold_boot_setup
+	dsb 	sy
 endfunc wfi_loop
 
 	.pushsection .data

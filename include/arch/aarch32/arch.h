@@ -633,6 +633,9 @@
 #define ICC_ASGI1R_EL1_64	p15, 1, c12
 #define ICC_SGI0R_EL1_64	p15, 2, c12
 
+/* 64 bit CPU Extended Control register defines*/
+#define CPUECTLR_64    p15, 1, c15
+
 /* Fault registers. The format is: coproc, opt1, CRn, CRm, opt2 */
 #define DFSR		p15, 0, c5, c0, 0
 #define IFSR		p15, 0, c5, c0, 1
