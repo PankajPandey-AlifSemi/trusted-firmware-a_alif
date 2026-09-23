@@ -19,6 +19,7 @@
 	.globl	plat_crash_console_flush
 	.globl	wfi_loop
 	.globl	secondary_cpu_flags
+	.extern	ensemble_secondary_ppu_off
 
 	/*
 	 * r1 = &secondary_cpu_flags[cpu - 1]
@@ -36,9 +37,11 @@
 	/* --------------------------------------------------------------------
 	 * void plat_secondary_cold_boot_setup(void);
 	 *
-	 * Park secondary CPUs until PSCI CPU_ON posts SECONDARY_CPU_GO_FLAG,
-	 * then jump to the SP_MIN warm entrypoint. Re-poll after each WFI
-	 * so a wake from HOST_CPU_WAKEUP is observed without depending on SEV.
+	 * Park secondary CPUs. CPU_ON posts SECONDARY_CPU_GO_FLAG and this
+	 * core jumps to the SP_MIN warm entrypoint. SYSTEM_OFF posts
+	 * SECONDARY_CLUSTER_OFF_FLAG and this core runs the local PPU-off
+	 * sequence. Re-poll after each WFI so a wake from HOST_CPU_WAKEUP
+	 * is observed without depending on SEV.
 	 * --------------------------------------------------------------------
 	 */
 func plat_secondary_cold_boot_setup
@@ -50,20 +53,27 @@ poll_flag:
 	secondary_flag_ptr
 	/*
 	 * SMPEN is clear, so this core is outside coherency. Invalidate
-	 * the flag line or CPU_ON stores are missed.
+	 * the flag line or CPU_ON / SYSTEM_OFF stores are missed.
 	 */
 	mcr	p15, 0, r1, c7, c6, 1	/* DCIMVAC */
 	dsb
 	ldr	r1, [r1]
+	ldr	r0, =SECONDARY_CLUSTER_OFF_FLAG
+	cmp	r1, r0
+	beq	do_ppu_off
 	ldr	r0, =SECONDARY_CPU_GO_FLAG
 	cmp	r1, r0
 	beq	go_warm
 	/*
-	 * WFI, not WFE: SEV will not wake this. CPU_ON must set
-	 * HOST_CPU_WAKEUP (and BOOT_MSK) to leave this WFI.
+	 * WFI, not WFE: SEV will not wake this. CPU_ON / SYSTEM_OFF
+	 * must set HOST_CPU_WAKEUP (and BOOT_MSK) to leave this WFI.
 	 */
 	wfi
 	b	poll_flag
+
+do_ppu_off:
+	ldr	r0, =ensemble_secondary_ppu_off
+	bx	r0
 
 go_warm:
 	/* Clear the go-flag before warm entry so CPU_OFF cannot re-take it. */
