@@ -100,6 +100,14 @@
 						MHU0_SIZE,              \
 						MT_DEVICE | MT_RW | MT_SECURE)
 
+/*
+ * APSS <-> M55-HE MHU0. Covered by DEVKIT_E7_MAP_DEVICE (0x1A000000).
+ * Channel 0 doorbells, same pairing as Linux mbox_m55_he_mhu0_tx/rx.
+ */
+#define ALIF_M55_MHU_TX_BASE		UL(0x1B040000)
+#define ALIF_M55_MHU_RX_BASE		UL(0x1B050000)
+#define ALIF_M55_MHU_ACK_TIMEOUT_US	UL(500000)
+
 #define NPU_HG_ADDR			(0x49042000)
 #define NPUHG_SIZE                      (0x2000)
 #define NPU_HG_MAP_DEVICE		MAP_REGION_FLAT(		\

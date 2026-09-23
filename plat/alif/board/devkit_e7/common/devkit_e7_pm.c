@@ -17,6 +17,7 @@
 #include <lib/cpus/aarch32/cortex_a32.h>
 #include <lib/mmio.h>
 #include <lib/psci/psci.h>
+#include <plat/alif/common/alif_mhu.h>
 #include <plat/alif/common/plat_alif.h>
 
 #define HOST_BASE_SYS_CTRL		UL(0x1A010000)
@@ -326,6 +327,15 @@ static void ensemble_force_secondary_ppu_off(void)
 static void __dead2 ensemble_system_off(void)
 {
 	INFO("PSCI: system off APSS cluster\n");
+
+	/*
+	 * Notify M55-HE before GIC / chassis teardown so the mailbox is
+	 * still live. A timeout does not abort SYSTEM_OFF.
+	 */
+	if (alif_mhu_notify_going_off() != 0) {
+		WARN("PSCI: M55-HE did not ACK A32_GOING_OFF; continuing\n");
+	}
+	alif_mhu_shutdown();
 
 	/*
 	 * A parked secondary is in WFI. Wake it the CPU_ON way with
