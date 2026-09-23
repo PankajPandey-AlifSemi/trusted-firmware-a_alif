@@ -84,6 +84,14 @@ override NEED_BL33	:=	no
 override RESET_TO_SP_MIN	:=	1
 override BL32_IN_XIP_MEM	:= 	1
 
+#
+# Bakery locks must live in normal memory with cache maintenance. PSCI CPU_OFF
+# runs cortex_a32_core_pwr_dwn(), which clears CPUECTLR.SMPEN before the
+# power-domain lock is released. Coherent bakery tickets then read as empty
+# and bakery_lock_release() asserts, so AFFINITY_INFO never reports OFF.
+#
+USE_COHERENT_MEM		:=	0
+
 # When the BL33 image is a Linux kernel, SP_MIN must pass it a preloaded
 # device tree. Other payloads (e.g. Zephyr) do not need one, so this is
 # opt-in via ARM_LINUX_KERNEL_AS_BL33=1.

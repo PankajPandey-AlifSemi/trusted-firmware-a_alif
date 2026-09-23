@@ -5,6 +5,7 @@
  */
 
 #include <assert.h>
+#include <stdbool.h>
 
 #include <platform_def.h>
 
@@ -20,6 +21,16 @@
 uintptr_t plat_get_ns_image_entrypoint(void)
 {
 	return PRELOADED_BL33_BASE;
+}
+
+/*
+ * Required by bakery_lock_normal.c when USE_COHERENT_MEM=0.
+ * Alif still uses the legacy xlat_tables library, which does not provide this
+ * helper (xlat_tables_v2 does).
+ */
+bool is_dcache_enabled(void)
+{
+	return (read_sctlr() & SCTLR_C_BIT) != 0U;
 }
 
 /*******************************************************************************
