@@ -25,8 +25,11 @@
 /*
  * Per-secondary mailbox words in secondary_cpu_flags[cpu - 1].
  * CPU_ON posts GO so the parked core takes the SP_MIN warm path.
+ * SYSTEM_OFF posts CLUSTER_OFF so a parked core that observes the flag
+ * runs the local PPU-off sequence. The primary waits on PPU_PWSR.
  */
 #define SECONDARY_CPU_GO_FLAG		0x000ADD
+#define SECONDARY_CLUSTER_OFF_FLAG	0x0000FF
 
 #define BL32_BASE			ALIF_TRUSTED_SRAM_BASE
 #define BL32_LIMIT			UL(BL32_BASE + ALIF_TRUSTED_SRAM_SIZE)

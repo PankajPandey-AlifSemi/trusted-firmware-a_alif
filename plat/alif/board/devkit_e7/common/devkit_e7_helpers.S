@@ -19,6 +19,7 @@
 	.globl	plat_crash_console_flush
 	.globl	wfi_loop
 	.globl	secondary_cpu_flags
+	.extern	ensemble_secondary_ppu_off
 
 	/*
 	 * r1 = &secondary_cpu_flags[cpu - 1]
@@ -36,34 +37,50 @@
 	/* --------------------------------------------------------------------
 	 * void plat_secondary_cold_boot_setup(void);
 	 *
-	 * Park secondary CPUs until PSCI CPU_ON posts SECONDARY_CPU_GO_FLAG,
-	 * then jump to the SP_MIN warm entrypoint. Re-poll after each WFI
-	 * so a wake from HOST_CPU_WAKEUP is observed without depending on SEV.
+	 * Park secondary CPUs. CPU_ON posts SECONDARY_CPU_GO_FLAG and this
+	 * core jumps to the SP_MIN warm entrypoint. SYSTEM_OFF posts
+	 * SECONDARY_CLUSTER_OFF_FLAG and this core runs the local PPU-off
+	 * sequence. Re-poll the flag after each WFI.
+	 *
+	 * HOST_CPU_WAKEUP is WAKEUPREQ. SSE-710 ignores it unless this
+	 * core's PPU is OFF or OFF_EMU, so it does not leave this WFI
+	 * while the core is parked ON. A GIC interrupt does. CPU_ON after
+	 * a PPU OFF still sets BOOT_MSK and HOST_CPU_WAKEUP. SSE-710
+	 * documents that pair for the first release after CLUSTOP leaves
+	 * OFF, MEM_RET, or WARM_RST. This loop does not switch that wake
+	 * to a GIC interrupt.
 	 * --------------------------------------------------------------------
 	 */
 func plat_secondary_cold_boot_setup
 	ldcopr16	r0, r1, CORTEX_A32_CPUECTLR_EL1
-	bic	r0, r0, #0x40		/* CPUECTLR.SMPEN */
+	bic	r0, r0, #CORTEX_A32_CPUECTLR_SMPEN_BIT
 	stcopr16	r0, r1, CORTEX_A32_CPUECTLR_EL1
 
 poll_flag:
 	secondary_flag_ptr
 	/*
 	 * SMPEN is clear, so this core is outside coherency. Invalidate
-	 * the flag line or CPU_ON stores are missed.
+	 * the flag line or CPU_ON / SYSTEM_OFF stores are missed.
 	 */
 	mcr	p15, 0, r1, c7, c6, 1	/* DCIMVAC */
 	dsb
 	ldr	r1, [r1]
+	ldr	r0, =SECONDARY_CLUSTER_OFF_FLAG
+	cmp	r1, r0
+	beq	do_ppu_off
 	ldr	r0, =SECONDARY_CPU_GO_FLAG
 	cmp	r1, r0
 	beq	go_warm
 	/*
-	 * WFI, not WFE: SEV will not wake this. CPU_ON must set
-	 * HOST_CPU_WAKEUP (and BOOT_MSK) to leave this WFI.
+	 * WFI. WAKEUPREQ does not leave this loop while the PPU is ON.
+	 * See the function comment for the CPU_ON wake after PPU OFF.
 	 */
 	wfi
 	b	poll_flag
+
+do_ppu_off:
+	ldr	r0, =ensemble_secondary_ppu_off
+	bx	r0
 
 go_warm:
 	/* Clear the go-flag before warm entry so CPU_OFF cannot re-take it. */
