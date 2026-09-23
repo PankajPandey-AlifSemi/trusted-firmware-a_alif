@@ -22,6 +22,12 @@
 					DEVKIT_E7_MAX_CPUS_PER_CLUSTER *   \
 					DEVKIT_E7_MAX_PE_PER_CPU)
 
+/*
+ * Per-secondary mailbox words in secondary_cpu_flags[cpu - 1].
+ * CPU_ON posts GO so the parked core takes the SP_MIN warm path.
+ */
+#define SECONDARY_CPU_GO_FLAG		0x000ADD
+
 #define BL32_BASE			ALIF_TRUSTED_SRAM_BASE
 #define BL32_LIMIT			UL(BL32_BASE + ALIF_TRUSTED_SRAM_SIZE)
 

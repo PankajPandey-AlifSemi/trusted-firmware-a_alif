@@ -6,51 +6,89 @@
 
 #include <arch.h>
 #include <asm_macros.S>
+#include <lib/cpus/aarch32/cortex_a32.h>
 #include <platform_def.h>
 
 	.globl	plat_secondary_cold_boot_setup
 	.globl	plat_get_my_entrypoint
 	.globl	plat_is_my_cpu_primary
 	.globl	plat_alif_calc_core_pos
-	.globl  plat_my_core_pos
+	.globl	plat_my_core_pos
 	.globl	plat_crash_console_init
 	.globl	plat_crash_console_putc
 	.globl	plat_crash_console_flush
 	.globl	wfi_loop
 	.globl	secondary_cpu_flags
 
-	/* --------------------------------------------------------------------
-	 * void plat_secondary_cold_boot_setup (void);
-	 * --------------------------------------------------------------------
+	/*
+	 * r1 = &secondary_cpu_flags[cpu - 1]
+	 * Clobbers: r0
 	 */
-func plat_secondary_cold_boot_setup
-	mrc p15, 0, r0, c0, c0, 5	/* Read MPIDR to get current cpu core */
-	and	r0, r0, #0x3
+	.macro secondary_flag_ptr
+	ldcopr	r0, MPIDR
+	and	r0, r0, #MPIDR_CPU_MASK
 	sub	r0, r0, #1
 	lsl	r0, r0, #2
 	ldr	r1, =secondary_cpu_flags
 	add	r1, r1, r0
-	ldr	r1, [r1 , #0]
-	mov	r0, #0xADD		/* Test if the flag 0xADD has been set */
+	.endm
+
+	/* --------------------------------------------------------------------
+	 * void plat_secondary_cold_boot_setup(void);
+	 *
+	 * Park secondary CPUs until PSCI CPU_ON posts SECONDARY_CPU_GO_FLAG,
+	 * then jump to the SP_MIN warm entrypoint. Re-poll after each WFI
+	 * so a wake from HOST_CPU_WAKEUP is observed without depending on SEV.
+	 * --------------------------------------------------------------------
+	 */
+func plat_secondary_cold_boot_setup
+	ldcopr16	r0, r1, CORTEX_A32_CPUECTLR_EL1
+	bic	r0, r0, #0x40		/* CPUECTLR.SMPEN */
+	stcopr16	r0, r1, CORTEX_A32_CPUECTLR_EL1
+
+poll_flag:
+	secondary_flag_ptr
+	/*
+	 * SMPEN is clear, so this core is outside coherency. Invalidate
+	 * the flag line or CPU_ON stores are missed.
+	 */
+	mcr	p15, 0, r1, c7, c6, 1	/* DCIMVAC */
+	dsb
+	ldr	r1, [r1]
+	ldr	r0, =SECONDARY_CPU_GO_FLAG
 	cmp	r1, r0
-	bne	wfi_loop		/* If not go to wfi and powerdown */
+	beq	go_warm
+	/*
+	 * WFI, not WFE: SEV will not wake this. CPU_ON must set
+	 * HOST_CPU_WAKEUP (and BOOT_MSK) to leave this WFI.
+	 */
+	wfi
+	b	poll_flag
+
+go_warm:
+	/* Clear the go-flag before warm entry so CPU_OFF cannot re-take it. */
+	secondary_flag_ptr
+	mov	r0, #0
+	str	r0, [r1]
+	dsb
 	ldr	r9, =sp_min_warm_entrypoint
 	mov	pc, r9
 endfunc plat_secondary_cold_boot_setup
 
+	/* --------------------------------------------------------------------
+	 * void wfi_loop(void);
+	 *
+	 * Alias of the secondary park loop (cold-boot hold path).
+	 * --------------------------------------------------------------------
+	 */
 func wfi_loop
-	mrrc    15, 1, r0, r1, cr15
-	bic     r0, r0, #0x40 		/* Disable SMP_EN bit in CPUECTLR reg */
-	mcrr    15, 1, r0, r1, cr15
-wfi_lp:	mov r0,r0
-	wfi
-	b	wfi_lp
+	b	plat_secondary_cold_boot_setup
 endfunc wfi_loop
 
 	.pushsection .data
 	.align 2
 secondary_cpu_flags:
-	.rept	10
+	.rept	PLATFORM_CORE_COUNT
 	.word	0
 	.endr
 	.popsection
