@@ -49,7 +49,8 @@ BL32_SOURCES		+=	lib/xlat_tables/aarch32/xlat_tables.c	\
 				plat/alif/common/alif_common.c		\
 				lib/cpus/aarch32/cortex_a32.S		\
 				plat/alif/board/devkit_e7/se_service/services.c		\
-				plat/arm/board/corstone700/common/drivers/mhu/corstone700_mhu.c
+				plat/arm/board/corstone700/common/drivers/mhu/corstone700_mhu.c	\
+				plat/alif/common/alif_mhu.c
 
 PLAT_INCLUDES		:=	-Iplat/alif/board/devkit_e7/common/include	\
 				-Iinclude/plat/alif/common			\

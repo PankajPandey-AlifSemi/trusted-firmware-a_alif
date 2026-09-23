@@ -16,6 +16,7 @@
 #include <drivers/delay_timer.h>
 #include <lib/mmio.h>
 #include <lib/psci/psci.h>
+#include <plat/alif/common/alif_mhu.h>
 #include <plat/alif/common/plat_alif.h>
 
 /*
@@ -300,6 +301,15 @@ static void __dead2 ensemble_system_off(void)
 	bool secondaries_off;
 
 	INFO("PSCI: system off APSS cluster\n");
+
+	/*
+	 * Notify M55-HE before GIC teardown so the mailbox is still
+	 * live. A timeout does not abort SYSTEM_OFF.
+	 */
+	if (alif_mhu_notify_going_off() != 0) {
+		WARN("PSCI: M55-HE did not ACK A32_GOING_OFF; continuing\n");
+	}
+	alif_mhu_shutdown();
 
 	/*
 	 * Ask any secondary whose PPU is still ON to run its own OFF
