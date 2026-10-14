@@ -10,10 +10,15 @@
 #include "ospi.h"
 #include <stdint.h>
 
-/* Write to the configuration register 0 of the ISSI hyperram device */
-int hyper_ram_write_conf_reg0(ospi_cfg_t *ospi, uint16_t data);
+/*
+ * Initialize the ISSI IS66/67WVH64M8 HyperRAM on OSPI0 and enter XIP mode:
+ * - Writes CR0 on both dies at 16.67 MHz with fixed latency of 6 clocks,
+ *   then reads ID0 and CR0 back
+ * - Raises the bus to 100 MHz (400 MHz core, baud 4)
+ * - Configures HyperBus XIP with read and write wait 2 x latency and no RWDS
+ *   latency signaling
+ * Pins must be configured by the caller.
+ */
+int issi_hyperram_init(void);
 
-/* Initialize hyperram xip mode */
-int hyper_ram_xip_init(ospi_cfg_t *ospi);
 #endif /* ISSI_HYPERRAM_H */
-

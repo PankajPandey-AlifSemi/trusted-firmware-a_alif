@@ -32,9 +32,6 @@
 #define PERIPH_CLK_ENA_OSPI0_CKEN       BIT(0)
 #define PERIPH_CLK_ENA_OSPI1_CKEN       BIT(1)
 
-/* ISS HyperRAM configuration */
-#define HYPRAM_CONFIG_REG0_VALUE        0x8f1d  /* 64-byte wrap length */
-
 /* External declarations */
 extern int init_nor_flash(void);
 extern int init_mx_nor_flash_dtr(void);
@@ -84,6 +81,11 @@ static void devkit_e7_devices_init(void)
 }
 
 #if ISSI_HYPERRAM_EN
+#define HYPERRAM_PAD_CTRL_DATA          (PADCTRL_READ_ENABLE | PADCTRL_SLEW_RATE_FAST | \
+                                         PADCTRL_OUTPUT_DRIVE_STRENGTH_12MA)
+#define HYPERRAM_PAD_CTRL_CLK           (PADCTRL_SLEW_RATE_FAST | \
+                                         PADCTRL_OUTPUT_DRIVE_STRENGTH_12MA)
+
 /**
  * @brief Configure ISS HyperRAM OSPI pins
  */
@@ -92,38 +94,23 @@ static void hyperram_pinmux_config(void)
     const struct {
         uint8_t port;
         uint8_t pin;
+        uint32_t pad_ctrl;
     } hyperram_pins[] = {
-        {PORT_2, PIN_0}, {PORT_2, PIN_1}, {PORT_2, PIN_2}, {PORT_2, PIN_3},
-        {PORT_2, PIN_4}, {PORT_2, PIN_5}, {PORT_2, PIN_6}, {PORT_2, PIN_7},
-        {PORT_3, PIN_0}, {PORT_3, PIN_1}, {PORT_3, PIN_2}, {PORT_1, PIN_6}
+        /* DQ[7:0] and RWDS */
+        {PORT_2, PIN_0, HYPERRAM_PAD_CTRL_DATA}, {PORT_2, PIN_1, HYPERRAM_PAD_CTRL_DATA},
+        {PORT_2, PIN_2, HYPERRAM_PAD_CTRL_DATA}, {PORT_2, PIN_3, HYPERRAM_PAD_CTRL_DATA},
+        {PORT_2, PIN_4, HYPERRAM_PAD_CTRL_DATA}, {PORT_2, PIN_5, HYPERRAM_PAD_CTRL_DATA},
+        {PORT_2, PIN_6, HYPERRAM_PAD_CTRL_DATA}, {PORT_2, PIN_7, HYPERRAM_PAD_CTRL_DATA},
+        {PORT_1, PIN_6, HYPERRAM_PAD_CTRL_DATA},
+        /* CK, CK# and CS# are outputs only */
+        {PORT_3, PIN_0, HYPERRAM_PAD_CTRL_CLK}, {PORT_3, PIN_1, HYPERRAM_PAD_CTRL_CLK},
+        {PORT_3, PIN_2, HYPERRAM_PAD_CTRL_CLK}
     };
-
-    uint32_t pad_ctrl = PADCTRL_READ_ENABLE | PADCTRL_OUTPUT_DRIVE_STRENGTH_12MA;
 
     for (size_t i = 0; i < ARRAY_SIZE(hyperram_pins); i++) {
         pinconf_set(hyperram_pins[i].port, hyperram_pins[i].pin,
-                   PINMUX_ALTERNATE_FUNCTION_1, pad_ctrl);
+                   PINMUX_ALTERNATE_FUNCTION_1, hyperram_pins[i].pad_ctrl);
     }
-}
-
-/**
- * @brief Initialize OSPI controller for ISS HyperRAM
- *
- * @param ospi_cfg Pointer to OSPI configuration structure
- */
-static void ospi_controller_init(ospi_cfg_t *ospi_cfg)
-{
-    ospi_cfg->regs = (ospi_regs_t *)OSPI0_BASE;
-    ospi_cfg->aes_regs = (aes_regs_t *)AES0_BASE;
-    ospi_cfg->ss = 0;
-
-    ospi_disable(ospi_cfg);
-
-    writel(ospi_cfg, baudr, 0x4);
-    writel(ospi_cfg, rx_sample_dly, 0x5);
-    writel(ospi_cfg, txd_drive_edge, 0x1);
-
-    ospi_enable(ospi_cfg);
 }
 
 /**
@@ -131,26 +118,14 @@ static void ospi_controller_init(ospi_cfg_t *ospi_cfg)
  */
 static void iss_hyperram_init(void)
 {
-    static ospi_cfg_t ospi_cfg;
     int ret;
 
     /* Configure pinmux for HyperRAM OSPI signals */
     hyperram_pinmux_config();
 
-    /* Initialize OSPI controller */
-    ospi_controller_init(&ospi_cfg);
-
-    /* Write HyperRAM configuration register 0 */
-    ret = hyper_ram_write_conf_reg0(&ospi_cfg, HYPRAM_CONFIG_REG0_VALUE);
+    ret = issi_hyperram_init();
     if (ret != 0) {
-        ERROR("HyperRAM config register write failed: %d\n", ret);
-        panic();
-    }
-
-    /* Initialize XIP mode */
-    ret = hyper_ram_xip_init(&ospi_cfg);
-    if (ret != 0) {
-        ERROR("HyperRAM XIP initialization failed: %d\n", ret);
+        ERROR("HyperRAM initialization failed: %d\n", ret);
         panic();
     }
 
