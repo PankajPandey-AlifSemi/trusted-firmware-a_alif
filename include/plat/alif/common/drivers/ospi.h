@@ -73,6 +73,22 @@ typedef struct {
 	volatile uint32_t  aes_addr_control;	/* AES Address Control Register (0x10) - E8 only */
 	volatile uint32_t  reserved[3];		/* Reserved (0x14, 0x18, 0x1C)			*/
 	volatile uint32_t  aes_rxds_delay;	/* AES RXDS Delay Register (0x20)		*/
+	volatile uint32_t  reserved1[7];	/* Reserved (0x24-0x3C)				*/
+	volatile uint32_t  aes_rxd_delay_0;	/* RXD[3:0] delay (0x40)			*/
+	volatile uint32_t  aes_rxd_delay_1;	/* RXD[7:4] delay (0x44)			*/
+	volatile uint32_t  aes_rxd_delay_2;	/* RXD[11:8] delay (0x48)			*/
+	volatile uint32_t  aes_rxd_delay_3;	/* RXD[15:12] delay (0x4C)			*/
+	volatile uint32_t  aes_txd_delay_0;	/* TXD[3:0] delay (0x50)			*/
+	volatile uint32_t  aes_txd_delay_1;	/* TXD[7:4] delay (0x54)			*/
+	volatile uint32_t  aes_txd_delay_2;	/* TXD[11:8] delay (0x58)			*/
+	volatile uint32_t  aes_txd_delay_3;	/* TXD[15:12] delay (0x5C)			*/
+	volatile uint32_t  aes_ssi_oe_n_delay_0; /* SSI_OE_N[3:0] delay (0x60)		*/
+	volatile uint32_t  aes_ssi_oe_n_delay_1; /* SSI_OE_N[7:4] delay (0x64)		*/
+	volatile uint32_t  aes_ssi_oe_n_delay_2; /* SSI_OE_N[11:8] delay (0x68)		*/
+	volatile uint32_t  aes_ssi_oe_n_delay_3; /* SSI_OE_N[15:12] delay (0x6C)		*/
+	volatile uint32_t  aes_ss_n_delay;	/* SS_N delay (0x70)				*/
+	volatile uint32_t  aes_txd_dm_delay;	/* TXD_DM and DM_OE_N delay (0x74)		*/
+	volatile uint32_t  aes_sclk_delay;	/* SCLK and SCLKN delay (0x78)			*/
 } aes_regs_t;
 
 /* Bit fields in CTRLR0 based on DWC_ssi_databook.pdf v1.02a */

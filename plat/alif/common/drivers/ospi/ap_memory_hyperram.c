@@ -9,7 +9,18 @@
  * @brief AP Memory APS512Mb PSRAM driver for OSPI interface
  *
  * This driver initializes and configures the APS512Mb PSRAM for XIP access
- * via the OSPI0 controller in dual-octal DDR mode.
+ * via the OSPI0 controller in octal (8-bit) or dual-octal (16-bit) DDR mode.
+ * The bus runs at 200 MHz from the 400 MHz OSPI core clock, with latency
+ * code 7 and, on E8, the per-signal AES delay taps.
+ *
+ * Reset, identification and mode register programming run at 16.67 MHz so
+ * that they stay within the reset latency code, which the datasheet rates
+ * only to 133 MHz. The bus is raised to 200 MHz once the device carries
+ * latency code 7.
+ *
+ * The device runs in fixed latency. In variable latency a refresh collision
+ * pushes read data out by up to one more LC, which this XIP setup cannot
+ * follow.
  */
 
 #include <plat/alif/common/plat_alif.h>
@@ -36,11 +47,14 @@
 #define APS512Mb_CMD_MODE_REGISTER_WRITE      0xC0
 #define APS512Mb_CMD_GLOBAL_RESET             0xFF
 
-/* APS512Mb Wait Cycles */
-#define APS512Mb_INIT_REG_READ_WAIT_CYCLES    4
+/* APS512Mb Wait Cycles. Mode register reads take the read latency code worth
+ * of cycles (datasheet Table 6) and the device leaves reset at code 5. The
+ * controller wait-cycle fields count from zero, so a latency of N clocks is
+ * programmed as N - 1.
+ */
+#define APS512Mb_RESET_LATENCY_CODE           5
 #define APS512Mb_REG_WRITE_WAIT_CYCLES        0
 #define APS512Mb_RESET_WAIT_CYCLES            3
-#define APS512Mb_INIT_READ_WRITE_WAIT_CYCLES  4
 
 /* APS512Mb Mode Register Addresses */
 #define APS512Mb_MODE_REG0_ADDR               0x0
@@ -89,11 +103,27 @@
 #define SPI_TRANS_TYPE_FRF_DUAL_OCTAL          3
 #define SPI_TRANS_TYPE_FRF_DEFINED             2
 
-/* OSPI Controller Configuration */
-#define OSPI_BAUDR_VALUE                       0x4
-#define OSPI_RX_SAMPLE_DLY_VALUE               0x8
-#define OSPI_TXD_DRIVE_EDGE_VALUE              0x1
+/* OSPI Controller Configuration
+ * The baud divider is even only: 400 / 2 = 200 MHz on the bus and
+ * 400 / 24 = 16.67 MHz for device setup. The DDR drive edge only applies when
+ * the divider is greater than 2, so it is used during setup only.
+ */
+#define OSPI_CORE_CLK_HZ                       400000000U
+#define OSPI_SETUP_BAUDR_VALUE                 24U
+#define OSPI_BAUDR_VALUE                       2U
+#define OSPI_BUS_SPEED_HZ                      (OSPI_CORE_CLK_HZ / OSPI_BAUDR_VALUE)
+#define OSPI_SETUP_BUS_SPEED_HZ                (OSPI_CORE_CLK_HZ / OSPI_SETUP_BAUDR_VALUE)
+#define OSPI_SETUP_RX_SAMPLE_DLY_VALUE         0x8
+#define OSPI_RX_SAMPLE_DLY_VALUE               0x0
+#define OSPI_SETUP_TXD_DRIVE_EDGE_VALUE        0x1
+#define OSPI_TXD_DRIVE_EDGE_VALUE              0x0
 #define OSPI_TX_FIFO_DEPTH                     256
+
+/* CGU MISC_CLK_CTRL bit 0 picks the OSPI core clock, shared by OSPI0 and
+ * OSPI1: clear selects the 400 MHz AXI clock, set selects 266 MHz. An
+ * earlier boot may have left it set.
+ */
+#define CGU_MISC_CLK_CTRL_OSPI_CLK_SEL         BIT(0)
 #define OSPI_TXFTLR_TFT_SHIFT                  16
 
 /* OSPI CTRLR0 Register */
@@ -102,14 +132,18 @@
 #define OSPI_CTRLR0_DFS_32BIT                  31
 #define OSPI_FRAME_SIZE_16BIT_THRESHOLD        0x0F
 
-/* AES RXDS Delay Configuration */
-#if (AP_MEMORY_BUS_WIDTH == AP_MEMORY_BUS_WIDTH_16BIT)
+/* AES RXDS delay on SoCs without the per-signal delay taps. 16-bit mode
+ * drives a second strobe on the rise edge. The taps are board specific.
+ */
+#if !ALIF_SOC_E8
 #define AES_RXDS_DELAY_FALL_EDGE               15
 #define AES_RXDS_DELAY_RISE_EDGE               13
-#else
 #define AES_RXDS_DELAY_VALUE                   6
 #endif
 #define AES_RXDS_DELAY_RISE_SHIFT              8
+
+/* Conservative RXDS tap used while the bus runs at OSPI_SETUP_BUS_SPEED_HZ. */
+#define AES_RXDS_DELAY_SETUP_VALUE             11
 
 /* XIP Configuration */
 #define XIP_CNT_TIMEOUT_VALUE                  255
@@ -161,14 +195,70 @@
 /* Data Bus Width */
 #define DATA_BUS_WIDTH_BITS                    32
 
-/* PSRAM Configuration Values */
-#define PSRAM_WAIT_CYCLES                      4
+/* Datasheet Table 5 rates read latency code 7 to 200 MHz and Table 15 rates
+ * the write latency codes the same way, so one code covers both directions.
+ * MR0 encodes the read latency as (code - 3); MR4 encodes write latency
+ * code 7 as 0x1.
+ */
+#define APS512Mb_LATENCY_CODE                  7
+#define APS512Mb_MODE_REG0_READ_LATENCY_FIELD  (APS512Mb_LATENCY_CODE - 3)
+#define APS512Mb_MODE_REG4_WRITE_LATENCY_FIELD 0x1
+
+/* Fixed latency makes memory reads take 2 * LC and writes take WLC (datasheet
+ * Table 6). Register reads still take LC.
+ */
+#define PSRAM_READ_WAIT_CYCLES                 (2 * APS512Mb_LATENCY_CODE - 1)
+#define PSRAM_WRITE_WAIT_CYCLES                (APS512Mb_LATENCY_CODE - 1)
 #if (AP_MEMORY_BUS_WIDTH == AP_MEMORY_BUS_WIDTH_16BIT)
 #define PSRAM_DUAL_OCTAL_MODE_ENABLE           1
 #else
 #define PSRAM_DUAL_OCTAL_MODE_ENABLE           0
 #endif
 #define PSRAM_OSPI_SS_LINE                     0
+
+/* Per-signal AES delay taps. These registers exist only on E8, and at a baud
+ * divider of 2 the bus needs them.
+ */
+#if ALIF_SOC_E8
+#define AES_SIGNAL_DELAY_LANES                 16
+#define AES_TXD_DM_1_DELAY_SHIFT               8
+#define AES_DM_OE_N_DELAY_0_SHIFT              16
+#define AES_DM_OE_N_DELAY_1_SHIFT              24
+#define AES_SCLK_N_DELAY_SHIFT                 8
+#define AES_SS_N_1_DELAY_SHIFT                 8
+
+/* Fields and order follow the ospi_delay_cfg_t initializer printed by the
+ * XSPI calibrator, so its output for this board can replace the taps below.
+ */
+typedef struct {
+	uint32_t idx;
+	uint32_t sclk_freq;
+	uint8_t txd[AES_SIGNAL_DELAY_LANES];
+	uint8_t rxd[AES_SIGNAL_DELAY_LANES];
+	uint8_t ssioen[AES_SIGNAL_DELAY_LANES];
+	uint8_t rxds[2];
+	uint8_t txddm[2];
+	uint8_t dmoen[2];
+	uint8_t sclk;
+	uint8_t sclkn;
+	uint8_t ssn[2];
+} ap_memory_delay_cfg_t;
+
+/* Taps are board specific. These are the E8 AppKit 200 MHz values. */
+static const ap_memory_delay_cfg_t ap_memory_delay_cfg = {
+	.idx       = 0,
+	.sclk_freq = 200000000,
+	.txd       = { 5, 5, 5, 3, 5, 7, 4, 4, 9, 8, 8, 8, 8, 8, 8, 8 },
+	.rxd       = { 2, 3, 3, 2, 3, 2, 1, 2, 3, 2, 3, 3, 3, 3, 3, 3 },
+	.ssioen    = { 0 },
+	.rxds      = { 8, 3 },
+	.txddm     = { 7, 5 },
+	.dmoen     = { 0, 0 },
+	.sclk      = 0,
+	.sclkn     = 0,
+	.ssn       = { 0, 0 },
+};
+#endif /* ALIF_SOC_E8 */
 
 /**
  * @brief OSPI transfer helper structure for PSRAM operations
@@ -457,7 +547,10 @@ static void ap_memory_pinmux_config(void)
 }
 
 /**
- * @brief Initialize OSPI controller for APS512Mb PSRAM
+ * @brief Initialize OSPI controller for APS512Mb PSRAM setup traffic
+ *
+ * Runs below 133 MHz so that reset, identification and mode register
+ * programming stay inside what the device reset latency code supports.
  */
 static void ospi_psram_controller_init(ospi_cfg_t *ospi_cfg)
 {
@@ -465,18 +558,99 @@ static void ospi_psram_controller_init(ospi_cfg_t *ospi_cfg)
 	ospi_cfg->aes_regs = (aes_regs_t *)AES0_BASE;
 	ospi_cfg->ss = PSRAM_OSPI_SS_LINE;
 
+#if ALIF_SOC_E8
+	mmio_clrbits_32(CGU_MISC_CLK_CTRL, CGU_MISC_CLK_CTRL_OSPI_CLK_SEL);
+	dsb();
+#endif /* ALIF_SOC_E8 */
+
 	ospi_disable(ospi_cfg);
 
-	INFO("AP Memory: OSPI Controller Configuration\n");
+	INFO("AP Memory: OSPI0 setup at %u MHz (core %u MHz, baud %u)\n",
+	     OSPI_SETUP_BUS_SPEED_HZ / 1000000U,
+	     OSPI_CORE_CLK_HZ / 1000000U,
+	     OSPI_SETUP_BAUDR_VALUE);
+	writel(ospi_cfg, baudr, OSPI_SETUP_BAUDR_VALUE);
+	writel(ospi_cfg, rx_sample_dly, OSPI_SETUP_RX_SAMPLE_DLY_VALUE);
+	writel(ospi_cfg, txd_drive_edge, OSPI_SETUP_TXD_DRIVE_EDGE_VALUE);
+
+	ospi_cfg->aes_regs->aes_rxds_delay = AES_RXDS_DELAY_SETUP_VALUE;
+
+	ospi_enable(ospi_cfg);
+}
+
+#if ALIF_SOC_E8
+static uint32_t aes_pack_lane_delays(const uint8_t *taps)
+{
+	return (uint32_t)taps[0] | ((uint32_t)taps[1] << 8) |
+	       ((uint32_t)taps[2] << 16) | ((uint32_t)taps[3] << 24);
+}
+
+/**
+ * @brief Program the per-signal AES delay taps for the full bus speed
+ */
+static void ap_memory_apply_signal_delays(aes_regs_t *aes, const ap_memory_delay_cfg_t *cfg)
+{
+	if ((cfg->idx != 0U) || (cfg->sclk_freq != OSPI_BUS_SPEED_HZ)) {
+		WARN("AP Memory: delay taps are for OSPI%u at %u Hz, bus is OSPI0 at %u Hz\n",
+		     cfg->idx, cfg->sclk_freq, OSPI_BUS_SPEED_HZ);
+	}
+
+	aes->aes_txd_delay_0 = aes_pack_lane_delays(&cfg->txd[0]);
+	aes->aes_txd_delay_1 = aes_pack_lane_delays(&cfg->txd[4]);
+	aes->aes_txd_delay_2 = aes_pack_lane_delays(&cfg->txd[8]);
+	aes->aes_txd_delay_3 = aes_pack_lane_delays(&cfg->txd[12]);
+	aes->aes_rxd_delay_0 = aes_pack_lane_delays(&cfg->rxd[0]);
+	aes->aes_rxd_delay_1 = aes_pack_lane_delays(&cfg->rxd[4]);
+	aes->aes_rxd_delay_2 = aes_pack_lane_delays(&cfg->rxd[8]);
+	aes->aes_rxd_delay_3 = aes_pack_lane_delays(&cfg->rxd[12]);
+	aes->aes_ssi_oe_n_delay_0 = aes_pack_lane_delays(&cfg->ssioen[0]);
+	aes->aes_ssi_oe_n_delay_1 = aes_pack_lane_delays(&cfg->ssioen[4]);
+	aes->aes_ssi_oe_n_delay_2 = aes_pack_lane_delays(&cfg->ssioen[8]);
+	aes->aes_ssi_oe_n_delay_3 = aes_pack_lane_delays(&cfg->ssioen[12]);
+	aes->aes_ss_n_delay = (uint32_t)cfg->ssn[0] |
+			      ((uint32_t)cfg->ssn[1] << AES_SS_N_1_DELAY_SHIFT);
+	aes->aes_sclk_delay = (uint32_t)cfg->sclk |
+			      ((uint32_t)cfg->sclkn << AES_SCLK_N_DELAY_SHIFT);
+
+	/* x8 has no DQS/DM1, so its strobe and data mask taps stay zero. */
+#if (AP_MEMORY_BUS_WIDTH == AP_MEMORY_BUS_WIDTH_16BIT)
+	aes->aes_txd_dm_delay = (uint32_t)cfg->txddm[0] |
+				((uint32_t)cfg->txddm[1] << AES_TXD_DM_1_DELAY_SHIFT) |
+				((uint32_t)cfg->dmoen[0] << AES_DM_OE_N_DELAY_0_SHIFT) |
+				((uint32_t)cfg->dmoen[1] << AES_DM_OE_N_DELAY_1_SHIFT);
+	aes->aes_rxds_delay = (uint32_t)cfg->rxds[0] |
+			      ((uint32_t)cfg->rxds[1] << AES_RXDS_DELAY_RISE_SHIFT);
+#else
+	aes->aes_txd_dm_delay = (uint32_t)cfg->txddm[0] |
+				((uint32_t)cfg->dmoen[0] << AES_DM_OE_N_DELAY_0_SHIFT);
+	aes->aes_rxds_delay = cfg->rxds[0];
+#endif
+}
+#endif /* ALIF_SOC_E8 */
+
+/**
+ * @brief Raise the bus to OSPI_BUS_SPEED_HZ and set the AES sampling delays
+ */
+static void ospi_psram_set_full_speed(ospi_cfg_t *ospi_cfg)
+{
+	ospi_disable(ospi_cfg);
+
+#if (AP_MEMORY_BUS_WIDTH == AP_MEMORY_BUS_WIDTH_16BIT)
+	INFO("AP Memory: OSPI0 dual-octal 16-bit %u MHz (core %u MHz, baud %u)\n",
+#else
+	INFO("AP Memory: OSPI0 octal 8-bit %u MHz (core %u MHz, baud %u)\n",
+#endif
+	     OSPI_BUS_SPEED_HZ / 1000000U,
+	     OSPI_CORE_CLK_HZ / 1000000U,
+	     OSPI_BAUDR_VALUE);
 	writel(ospi_cfg, baudr, OSPI_BAUDR_VALUE);
 	writel(ospi_cfg, rx_sample_dly, OSPI_RX_SAMPLE_DLY_VALUE);
 	writel(ospi_cfg, txd_drive_edge, OSPI_TXD_DRIVE_EDGE_VALUE);
 
-	/* Configure AES RXDS delay for DDR mode
-	 * Bits [7:0]: RXDS delay for falling edge
-	 * Bits [15:8]: RXDS delay for rising edge (16-bit mode only)
-	 */
-#if (AP_MEMORY_BUS_WIDTH == AP_MEMORY_BUS_WIDTH_16BIT)
+	/* Bits [7:0] are the RXDS delay. 16-bit mode also sets the rise edge. */
+#if ALIF_SOC_E8
+	ap_memory_apply_signal_delays(ospi_cfg->aes_regs, &ap_memory_delay_cfg);
+#elif (AP_MEMORY_BUS_WIDTH == AP_MEMORY_BUS_WIDTH_16BIT)
 	ospi_cfg->aes_regs->aes_rxds_delay = AES_RXDS_DELAY_FALL_EDGE |
 			(AES_RXDS_DELAY_RISE_EDGE << AES_RXDS_DELAY_RISE_SHIFT);
 #else
@@ -489,7 +663,8 @@ static void ospi_psram_controller_init(ospi_cfg_t *ospi_cfg)
 /**
  * @brief Configure XIP mode for PSRAM
  */
-static void ospi_psram_xip_mode_init(ospi_cfg_t *ospi_cfg, uint8_t wait_cycles)
+static void ospi_psram_xip_mode_init(ospi_cfg_t *ospi_cfg, uint8_t read_wait_cycles,
+				     uint8_t write_wait_cycles)
 {
 	ospi_regs_t *regs = ospi_cfg->regs;
 
@@ -520,18 +695,22 @@ static void ospi_psram_xip_mode_init(ospi_cfg_t *ospi_cfg, uint8_t wait_cycles)
 	uint32_t xip_trans_type = SPI_TRANS_TYPE_FRF_DEFINED;
 #endif
 
-	/* Configure XIP control register */
+	/* RXDS signaling is HyperBus RWDS latency signaling. Xccela DQS carries no
+	 * latency information in the command phase and is only driven low up to
+	 * 6 ns (tCQLZ) after the third clock, so at 200 MHz the controller can
+	 * sample it high and wrongly double the latency of reads and writes.
+	 */
 	uint32_t xip_ctrl_val = (SPI_FRF_OCTAL << XIP_CTRL_FRF_POS)
 	                        | (xip_trans_type << XIP_CTRL_TRANS_TYPE_POS)
 	                        | (SPI_ADDR_L_32_BIT << XIP_CTRL_ADDR_L_POS)
 	                        | (SPI_INST_L_16_BIT << XIP_CTRL_INST_L_POS)
-	                        | (wait_cycles << XIP_CTRL_WAIT_CYCLES_POS)
+	                        | (read_wait_cycles << XIP_CTRL_WAIT_CYCLES_POS)
 	                        | (FEATURE_ENABLE << XIP_CTRL_DFS_HC_POS)
 	                        | (FEATURE_ENABLE << XIP_CTRL_DDR_EN_POS)
 	                        | (FEATURE_ENABLE << XIP_CTRL_INST_DDR_EN_POS)
 	                        | (FEATURE_ENABLE << XIP_CTRL_RXDS_EN_POS)
 	                        | (FEATURE_ENABLE << XIP_CTRL_INST_EN_POS)
-	                        | (FEATURE_ENABLE << XIP_CTRL_RXDS_SIG_EN_POS);
+	                        | (FEATURE_DISABLE << XIP_CTRL_RXDS_SIG_EN_POS);
 
 	regs->xip_ctrl = xip_ctrl_val;
 
@@ -542,12 +721,19 @@ static void ospi_psram_xip_mode_init(ospi_cfg_t *ospi_cfg, uint8_t wait_cycles)
 	                           | (SPI_INST_L_16_BIT << XIP_WR_CTRL_INST_L_POS)
 	                           | (FEATURE_ENABLE << XIP_WR_CTRL_DDR_EN_POS)
 	                           | (FEATURE_ENABLE << XIP_WR_CTRL_INST_DDR_EN_POS)
-	                           | (FEATURE_ENABLE << XIP_WR_CTRL_RXDS_SIG_EN_POS)
+	                           | (FEATURE_DISABLE << XIP_WR_CTRL_RXDS_SIG_EN_POS)
 	                           | (FEATURE_ENABLE << XIP_WR_CTRL_DM_EN_POS)
-	                           | (wait_cycles << XIP_WR_CTRL_WAIT_CYCLES_POS)
+	                           | (write_wait_cycles << XIP_WR_CTRL_WAIT_CYCLES_POS)
 	                           | (FEATURE_ENABLE << XIP_WR_CTRL_DFS_HC_POS);
 
 	regs->xip_write_ctrl = xip_wr_ctrl_val;
+
+	/* The polled register writes leave a transfer start level in
+	 * TXFTLR[23:16]. XIP starts from a cleared TXFTLR, and the AES taps
+	 * rather than the controller sample delay place the read capture.
+	 */
+	regs->txftlr = 0;
+	regs->rx_sample_dly = OSPI_RX_SAMPLE_DLY_VALUE;
 
 	ospi_enable(ospi_cfg);
 }
@@ -581,29 +767,29 @@ int ap_memory_hyperram_init(void)
 	aps512mb_global_reset(ospi_cfg);
 	INFO("AP Memory: Global reset completed\n");
 
-	/* Read and verify device ID */
+	/* Read and verify device ID at the reset latency */
 	reg_value = aps512mb_read_reg(ospi_cfg, APS512Mb_MODE_REG2_ADDR,
-	                                APS512Mb_INIT_REG_READ_WAIT_CYCLES);
+	                                APS512Mb_RESET_LATENCY_CODE - 1);
 	INFO("AP Memory: Device ID = 0x%02X (expected: 0x%02X)\n", reg_value, APS512Mb_ID);
 	if (reg_value != APS512Mb_ID) {
 		ERROR("AP Memory: Device ID mismatch!\n");
 		return -1;
 	}
 
-	/* Configure wait cycles if needed */
-	if (PSRAM_WAIT_CYCLES != APS512Mb_INIT_READ_WRITE_WAIT_CYCLES) {
-		/* Configure read wait cycles (MR0) */
-		reg_value = (FEATURE_DISABLE << APS512Mb_MODE_REG0_LATENCY_TYPE)
-		             | (PSRAM_WAIT_CYCLES << APS512Mb_MODE_REG0_READ_LATENCY_CODE)
-		             | (FEATURE_DISABLE << APS512Mb_MODE_REG0_DRIVE_STR);
-		aps512mb_write_reg(ospi_cfg, APS512Mb_MODE_REG0_ADDR, reg_value);
+	/* Move the device to fixed latency at the code rated for OSPI_BUS_SPEED_HZ. */
+	reg_value = (FEATURE_ENABLE << APS512Mb_MODE_REG0_LATENCY_TYPE)
+	             | (APS512Mb_MODE_REG0_READ_LATENCY_FIELD << APS512Mb_MODE_REG0_READ_LATENCY_CODE)
+	             | (FEATURE_DISABLE << APS512Mb_MODE_REG0_DRIVE_STR);
+	aps512mb_write_reg(ospi_cfg, APS512Mb_MODE_REG0_ADDR, reg_value);
 
-		/* Configure write wait cycles (MR4) */
-		reg_value = (FEATURE_DISABLE << APS512Mb_MODE_REG4_READ_RF_RATE)
-		             | (PSRAM_WAIT_CYCLES << APS512Mb_MODE_REG4_WRITE_LATENCY_CODE)
-		             | (FEATURE_DISABLE << APS512Mb_MODE_REG4_PASR);
-		aps512mb_write_reg(ospi_cfg, APS512Mb_MODE_REG4_ADDR, reg_value);
-	}
+	reg_value = (FEATURE_DISABLE << APS512Mb_MODE_REG4_READ_RF_RATE)
+	             | (APS512Mb_MODE_REG4_WRITE_LATENCY_FIELD << APS512Mb_MODE_REG4_WRITE_LATENCY_CODE)
+	             | (FEATURE_DISABLE << APS512Mb_MODE_REG4_PASR);
+	aps512mb_write_reg(ospi_cfg, APS512Mb_MODE_REG4_ADDR, reg_value);
+
+	INFO("AP Memory: bus %u MHz, fixed latency code %u, XIP read wait %u, write wait %u\n",
+	     OSPI_BUS_SPEED_HZ / 1000000U, APS512Mb_LATENCY_CODE,
+	     PSRAM_READ_WAIT_CYCLES, PSRAM_WRITE_WAIT_CYCLES);
 
 	/* Configure device mode (MR8) - enable dual octal mode */
 	reg_value = (FEATURE_ENABLE << APS512Mb_MODE_REG8_BURST_LEN_32B)
@@ -612,9 +798,9 @@ int ap_memory_hyperram_init(void)
 	             | (PSRAM_DUAL_OCTAL_MODE_ENABLE << APS512Mb_MODE_REG8_TRANSFER_MODE);
 	aps512mb_write_reg(ospi_cfg, APS512Mb_MODE_REG8_ADDR, reg_value);
 
-	/* Verify MR8 configuration */
+	/* Verify MR8 configuration, now at the programmed read latency */
 	reg_value = aps512mb_read_reg(ospi_cfg, APS512Mb_MODE_REG8_ADDR,
-	                                APS512Mb_INIT_REG_READ_WAIT_CYCLES);
+	                                APS512Mb_LATENCY_CODE - 1);
 #if (AP_MEMORY_BUS_WIDTH == AP_MEMORY_BUS_WIDTH_16BIT)
 	INFO("AP Memory: MR8 = 0x%02X (dual-octal 16-bit mode)\n", reg_value);
 #else
@@ -635,11 +821,16 @@ int ap_memory_hyperram_init(void)
 		ospi_cfg->aes_regs->aes_addr_control = aes_addr_ctrl_val;
 	}
 
+	/* The device now tolerates the full bus speed, so switch to it before
+	 * any XIP traffic can start.
+	 */
+	ospi_psram_set_full_speed(ospi_cfg);
+
 	/* Set final data frame size */
 	ospi_psram_set_dfs(ospi_cfg, DATA_BUS_WIDTH_BITS);
 
 	/* Configure XIP mode */
-	ospi_psram_xip_mode_init(ospi_cfg, PSRAM_WAIT_CYCLES);
+	ospi_psram_xip_mode_init(ospi_cfg, PSRAM_READ_WAIT_CYCLES, PSRAM_WRITE_WAIT_CYCLES);
 
 	/* Enable AES XIP */
 	ospi_cfg->aes_regs->aes_control |= AES_CONTROL_XIP_EN;
