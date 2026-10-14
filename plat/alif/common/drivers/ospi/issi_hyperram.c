@@ -17,6 +17,7 @@
  */
 
 #include <plat/alif/common/plat_alif.h>
+#include <platform_def.h>
 #include <lib/mmio.h>
 #include <common/debug.h>
 #include <plat/alif/common/drivers/ospi.h>
@@ -58,12 +59,6 @@
 /* 16-bit frames and a 48-bit command-address for every HyperBus transfer. */
 #define IS66_OSPI_DFS				16U
 #define IS66_OSPI_ADDR_L_48_BIT			0xCU
-
-/* CGU MISC_CLK_CTRL bit 0 picks the OSPI core clock, shared by OSPI0 and
- * OSPI1: clear selects the 400 MHz AXI clock, set selects 266 MHz. An
- * earlier boot may have left it set.
- */
-#define CGU_MISC_CLK_CTRL_OSPI_CLK_SEL		BIT(0)
 
 /* The baud divider is even only: 400 / 4 = 100 MHz on the bus and
  * 400 / 24 = 16.67 MHz while CR0 is written.
@@ -325,8 +320,7 @@ static void hyper_ram_xip_init(ospi_cfg_t *ospi)
 
     ospi_disable(ospi);
 
-    val = OSPI_CTRLR0_IS_MST |
-          (SPI_OCTAL << OSPI_CTRLR0_SPI_FRF_OFFSET) |
+    val = (SPI_OCTAL << OSPI_CTRLR0_SPI_FRF_OFFSET) |
           (SPI_TMOD_RO << OSPI_CTRLR0_TMOD_OFFSET) |
           ((IS66_OSPI_DFS - 1U) << OSPI_CTRLR0_DFS_OFFSET);
 

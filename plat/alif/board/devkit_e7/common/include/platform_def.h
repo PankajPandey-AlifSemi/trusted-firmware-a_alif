@@ -220,6 +220,8 @@
 #define PINMUX_BASE			(0x1A603000)
 #define CGU_BASE			(0x1A602000)
 #define CGU_MISC_CLK_CTRL		(CGU_BASE + 0x24)
+/* Bit 0: OSPI core clock select (400 MHz AXI when clear, 266 MHz when set). */
+#define CGU_MISC_CLK_CTRL_OSPI_CLK_SEL		BIT(0)
 #define LPGPIO_CTRL_BASE		(0x42007000)
 #define OSPI0_BASE			(0x83000000)
 #define OSPI1_BASE			(0x83002000)
